@@ -7,6 +7,7 @@ const cors = require("cors");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const crypto = require("crypto");
+const BlindTimer = require("./models/BlindTimer");
 
 const User = require("./models/User");
 const League = require("./models/League");
@@ -138,6 +139,24 @@ function creatorOnly(req, res, next) {
 
   next();
 }
+
+async function disconnectSeasonMembers(league) {
+  const creatorId = league.creator.toString();
+
+  const formerMemberIds = league.members.filter(
+    (memberId) => memberId.toString() !== creatorId
+  );
+
+  if (formerMemberIds.length > 0) {
+    await User.updateMany(
+      { _id: { $in: formerMemberIds } },
+      { $pull: { leagues: league._id } }
+    );
+  }
+
+  league.members = [league.creator];
+}
+
 
 // Basic API checks
 app.get("/", (req, res) => {
@@ -332,6 +351,62 @@ async function generateInviteCode() {
 }
 
 
+ // Allow a member to disconnect without deleting league data
+
+app.post(
+  "/api/leagues/leave",
+  authenticate,
+  async (req, res, next) => {
+    try {
+      const leagueId = req.headers["x-league-id"];
+
+      if (!leagueId || !mongoose.isValidObjectId(leagueId)) {
+        return res.status(400).json({
+          message: "A valid league ID is required."
+        });
+      }
+
+      const league = await League.findById(leagueId);
+
+      if (!league) {
+        return res.status(404).json({
+          message: "League not found."
+        });
+      }
+
+      const userId = String(req.user._id);
+      const creatorId = String(
+        league.creator?._id || league.creator
+      );
+
+      if (userId === creatorId) {
+        return res.status(403).json({
+          message: "The creator cannot disconnect from their own league."
+        });
+      }
+
+      // Remove this user from the league.
+      await League.updateOne(
+        { _id: league._id },
+        { $pull: { members: req.user._id } }
+      );
+
+      // Remove the league from this user's account.
+      await User.updateOne(
+        { _id: req.user._id },
+        { $pull: { leagues: league._id } }
+      );
+
+      return res.json({
+        message: "Disconnected from shared league successfully."
+      });
+
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
 // List leagues for the logged-in user
 app.get("/api/leagues", authenticate, async (req, res, next) => {
   try {
@@ -483,7 +558,39 @@ app.post("/api/leagues/join", authenticate, async (req, res, next) => {
     next(error);
   }
 });
+app.post(
+  "/api/leagues/leave",
+  authenticate,
+  getActiveLeague,
+  async (req, res, next) => {
+    try {
+      const userId = req.user._id.toString();
+      const creatorId = req.league.creator.toString();
 
+      if (userId === creatorId) {
+        return res.status(403).json({
+          message: "Creator cannot disconnect from their own league."
+        });
+      }
+
+      req.league.members = req.league.members.filter(
+        (memberId) => memberId.toString() !== userId
+      );
+
+      await req.league.save();
+
+      await User.findByIdAndUpdate(req.user._id, {
+        $pull: { leagues: req.league._id }
+      });
+
+      res.json({
+        message: "Disconnected from shared league successfully."
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
 
 // Read shared league information (members only)
 app.get(
@@ -538,6 +645,9 @@ app.put(
   creatorOnly,
   async (req, res, next) => {
     try {
+      
+const wasSeasonActive = req.league.seasonActive !== false;
+
       const {
         seasonName,
         seasonActive,
@@ -613,6 +723,9 @@ app.put(
 
         req.league.finalists = finalists;
       }
+
+      
+
 
       await req.league.save();
 
@@ -816,6 +929,8 @@ app.delete("/api/players/:id", authenticate, getActiveLeague, creatorOnly, async
 });
 
 // Save or update a tournament's results
+
+
 app.put(
   "/api/tournaments/:number",
   authenticate,
@@ -835,11 +950,15 @@ app.put(
         });
       }
 
-      const { results } = req.body;
+      const { results, editPlayerIds = [] } = req.body;
 
-      if (!Array.isArray(results)) {
+      if (
+        !Array.isArray(results) ||
+        !Array.isArray(editPlayerIds) ||
+        !editPlayerIds.every((id) => typeof id === "string")
+      ) {
         return res.status(400).json({
-          message: "Results must be an array."
+          message: "Invalid tournament results or edit permissions."
         });
       }
 
@@ -854,46 +973,124 @@ app.put(
         ])
       );
 
-      const seenPlayers = new Set();
-      const seenPositions = new Set();
-      const cleanResults = [];
+      const existingTournament = await Tournament.findOne({
+        leagueId: req.league._id,
+        tournamentNumber
+      });
 
+      const existingResults = existingTournament?.results || [];
+      const existingMap = new Map(
+        existingResults.map((result) => [
+          result.player.toString(),
+          result
+        ])
+      );
+
+      const editsAllowed = new Set(editPlayerIds);
+      const incomingMap = new Map();
+
+      // Validate each submitted rank.
       for (const result of results) {
         const playerId = String(result.player || "");
         const position = Number(result.position);
+        console.log("BACKEND RANK DEBUG:", {
+  playerId: String(result.player),
+  positionReceived: result.position,
+  position,
+  leaguePoints: req.league.points,
+  pointsForRank: req.league.points[position - 1],
+});
+        const confirmed = result.confirmed === true;
 
         if (
           !playerMap.has(playerId) ||
-          seenPlayers.has(playerId) ||
+          incomingMap.has(playerId) ||
           !Number.isInteger(position) ||
           position < 1 ||
-          position > players.length ||
-          seenPositions.has(position)
+          position > players.length
         ) {
           return res.status(400).json({
-            message: "Each player and finishing position must be valid and unique."
+            message: "Each player and finishing rank must be valid."
           });
         }
 
-        seenPlayers.add(playerId);
-        seenPositions.add(position);
+        const existingResult = existingMap.get(playerId);
 
-        const points = Number(
-          req.league.points[position - 1] ?? 0
-        );
+        const rankChanged =
+          existingResult &&
+          (
+            Number(existingResult.position) !== position ||
+            existingResult.confirmed !== confirmed
+          );
 
-        cleanResults.push({
+        if (
+          existingResult?.confirmed === true &&
+          rankChanged &&
+          !editsAllowed.has(playerId)
+        ) {
+          return res.status(409).json({
+            message:
+              "This rank is confirmed. Use Edit before changing it."
+          });
+        }
+
+        incomingMap.set(playerId, {
           player: playerId,
           position,
-          points
+          points: Number(req.league.points[position - 1] ?? 0),
+          confirmed
         });
       }
 
-      // Require every league player to have a result.
-      if (cleanResults.length !== players.length) {
-        return res.status(400).json({
-          message: "Add a finishing position for every player."
+      // Preserve saved ranks that were not included in this request.
+      const mergedMap = new Map();
+
+      for (const [playerId, saved] of existingMap) {
+        mergedMap.set(playerId, {
+          player: playerId,
+          position: Number(saved.position),
+          points: Number(saved.points || 0),
+          confirmed: saved.confirmed === true
         });
+      }
+
+      // Apply submitted ranks over the preserved results.
+      for (const [playerId, result] of incomingMap) {
+        mergedMap.set(playerId, result);
+      }
+
+      const cleanResults = [...mergedMap.values()].map((result) => ({
+  ...result,
+  
+  points: Number(req.league.points[Number(result.position) - 1] ?? 0),
+}));
+console.log(
+  "TOURNAMENT POINTS DEBUG:",
+  {
+    leaguePoints: req.league.points,
+    results: cleanResults.map((r) => ({
+      player: String(r.player),
+      position: r.position,
+      points: r.points,
+      confirmed: r.confirmed,
+    })),
+  }
+);
+const seenPositions = new Set();
+      // Validate the complete result list, including preserved ranks.
+      for (const result of cleanResults) {
+        if (
+          seenPositions.has(result.position) ||
+          result.position < 1 ||
+          result.position > players.length
+        ) {
+          return res.status(409).json({
+            message:
+              "Two players cannot have the same rank. Please correct the positions."
+          });
+        }
+
+        seenPositions.add(result.position);
       }
 
       const tournament = await Tournament.findOneAndUpdate(
@@ -914,7 +1111,7 @@ app.put(
         }
       );
 
-      // Recalculate totals from all saved tournaments.
+      // Recalculate points across all tournaments.
       const allTournaments = await Tournament.find({
         leagueId: req.league._id
       });
@@ -928,11 +1125,12 @@ app.put(
 
       for (const savedTournament of allTournaments) {
         for (const result of savedTournament.results) {
-          const id = result.player.toString();
-          if (totals.has(id)) {
+          const playerId = result.player.toString();
+
+          if (totals.has(playerId)) {
             totals.set(
-              id,
-              totals.get(id) + Number(result.points || 0)
+              playerId,
+              totals.get(playerId) + Number(result.points || 0)
             );
           }
         }
@@ -948,18 +1146,30 @@ app.put(
         )
       );
 
+      const updatedPlayers = await Player.find({
+        leagueId: req.league._id
+      }).sort({ totalPoints: -1, name: 1 });
+      console.log(
+  "UPDATED PLAYER TOTALS:",
+  updatedPlayers.map((p) => ({
+    name: p.name,
+    totalPoints: p.totalPoints,
+  }))
+);
+
       res.json({
         message: "Tournament results saved.",
         tournament,
-        players: await Player.find({
-          leagueId: req.league._id
-        }).sort({ totalPoints: -1, name: 1 })
+        completed: cleanResults.length === players.length,
+        players: updatedPlayers
       });
     } catch (error) {
       next(error);
     }
   }
 );
+
+
 
 app.get(
   "/api/tournaments",
@@ -1112,6 +1322,7 @@ app.post(
 
 // Save a completed season to the archive
 
+
 app.post(
   "/api/season/archive",
   authenticate,
@@ -1119,19 +1330,34 @@ app.post(
   creatorOnly,
   async (req, res, next) => {
     try {
-      
+      // If this season was already archived, disconnect any
+// friends who were left connected by the earlier code.
 if (req.league.seasonActive === false) {
-  return res.status(409).json({
-    message: "This season has already been archived."
-  });
-}
+  const creatorId = req.league.creator.toString();
 
-      
-if (req.league.seasonActive === false) {
-  return res.status(409).json({
-    message: "This season has already been archived."
+  const formerMemberIds = req.league.members.filter(
+    (memberId) => memberId.toString() !== creatorId
+  );
+
+  if (formerMemberIds.length > 0) {
+    await User.updateMany(
+      { _id: { $in: formerMemberIds } },
+      { $pull: { leagues: req.league._id } }
+    );
+  }
+
+  req.league.members = [req.league.creator];
+  await req.league.save();
+
+  return res.json({
+    message: "Season already archived. Friends disconnected."
   });
 }
+      if (req.league.seasonActive === false) {
+        return res.status(409).json({
+          message: "This season has already been archived."
+        });
+      }
 
       const players = await Player.find({
         leagueId: req.league._id
@@ -1160,10 +1386,12 @@ if (req.league.seasonActive === false) {
             ).length,
             played: playerResults.length,
             positions: Array.from(
-  { length: players.length },
-  (_, index) =>
-    playerResults.filter((position) => position === index + 1).length
-)
+              { length: players.length },
+              (_, index) =>
+                playerResults.filter(
+                  (position) => position === index + 1
+                ).length
+            )
           };
         })
         .sort((a, b) => b.points - a.points);
@@ -1179,49 +1407,7 @@ if (req.league.seasonActive === false) {
         });
       }
 
-      let archivedSeason;
-
-      // If this season was already archived, UPDATE its existing
-      // history record instead of creating a duplicate.
-      if (req.league.seasonActive === false) {
-        archivedSeason = await Season.findOneAndUpdate(
-          {
-            leagueId: req.league._id,
-            name: req.league.seasonName
-          },
-          {
-            $set: {
-              format: req.league.format,
-              champion,
-              tournaments: tournaments.length,
-              standings
-            }
-          },
-          {
-            new: true,
-            sort: { createdAt: -1 }
-          }
-        );
-
-        if (!archivedSeason) {
-          return res.status(409).json({
-            message:
-              "This season is already closed. Start a new season before archiving again."
-          });
-        }
-
-        req.league.champion = champion;
-        await req.league.save();
-
-        return res.json({
-          message: "Existing season archive updated successfully.",
-          season: archivedSeason,
-          updated: true
-        });
-      }
-
-      // First archive: create one history record.
-      archivedSeason = await Season.create({
+      const archivedSeason = await Season.create({
         leagueId: req.league._id,
         name: req.league.seasonName,
         format: req.league.format,
@@ -1231,11 +1417,33 @@ if (req.league.seasonActive === false) {
         standings
       });
 
-      req.league.champion = champion;
-      req.league.seasonActive = false;
-      await req.league.save();
+    req.league.champion = champion;
+req.league.seasonActive = false;
 
-      res.status(201).json({
+const creatorId = req.league.creator.toString();
+
+const formerMemberIds = req.league.members.filter(
+  (memberId) => memberId.toString() !== creatorId
+);
+
+if (formerMemberIds.length > 0) {
+  await User.updateMany(
+    { _id: { $in: formerMemberIds } },
+    { $pull: { leagues: req.league._id } }
+  );
+}
+
+req.league.members = [req.league.creator];
+await req.league.save();
+console.log("ARCHIVE MEMBERSHIP CHECK:", {
+  leagueId: req.league._id.toString(),
+  creatorId: req.league.creator.toString(),
+  membersAfterSave: req.league.members.map(
+    (memberId) => memberId.toString()
+  ),
+  seasonActive: req.league.seasonActive
+});
+      return res.status(201).json({
         message: "Season archived successfully.",
         season: archivedSeason,
         updated: false
@@ -1390,6 +1598,324 @@ app.put(
     }
   }
 );
+
+const DEFAULT_BLIND_LEVELS = [
+  { sb: 10, bb: 20 },
+  { sb: 20, bb: 40 },
+  { sb: 30, bb: 60 },
+  { sb: 40, bb: 80 },
+  { sb: 50, bb: 100 },
+  { sb: 75, bb: 150 },
+  { sb: 100, bb: 200 },
+];
+
+function blindTimerResponse(timer) {
+  const now = Date.now();
+
+  return {
+    duration: timer.duration,
+    levelIndex: timer.levelIndex,
+    secondsLeft:
+      timer.running && timer.deadline
+        ? Math.max(0, Math.ceil((timer.deadline - now) / 1000))
+        : timer.secondsLeft,
+    running: timer.running,
+    deadline: timer.deadline,
+    levels: timer.levels.map((level) => ({
+      sb: level.sb,
+      bb: level.bb,
+    })),
+  };
+}
+
+// All league members can view the timer.
+app.get(
+  "/api/blind-timer",
+  authenticate,
+  getActiveLeague,
+  async (req, res, next) => {
+    try {
+      let timer = await BlindTimer.findOne({
+        leagueId: req.league._id,
+      });
+
+      if (!timer) {
+        timer = await BlindTimer.create({
+          leagueId: req.league._id,
+          levels: DEFAULT_BLIND_LEVELS,
+        });
+      }
+
+      const now = Date.now();
+      let changed = false;
+
+      // Advance levels using the saved server deadline.
+      while (
+  timer.running &&
+  timer.deadline &&
+  timer.deadline <= now
+) {
+        if (timer.levelIndex >= timer.levels.length - 1) {
+          timer.running = false;
+          timer.deadline = null;
+          timer.secondsLeft = 0;
+          changed = true;
+          break;
+        }
+
+        timer.levelIndex += 1;
+        timer.deadline += timer.duration * 60 * 1000;
+        timer.secondsLeft = Math.max(
+          0,
+          Math.ceil((timer.deadline - now) / 1000)
+        );
+        changed = true;
+      }
+
+      if (changed) {
+        await timer.save();
+      }
+
+      res.json({ timer: blindTimerResponse(timer) });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+// Only the league creator can change timer settings or controls.
+app.put(
+  "/api/blind-timer",
+  authenticate,
+  getActiveLeague,
+  creatorOnly,
+  async (req, res, next) => {
+    try {
+      const duration = Number(req.body.duration);
+      const levelIndex = Number(req.body.levelIndex);
+      const secondsLeft = Number(req.body.secondsLeft);
+      const running = req.body.running;
+      const levels = req.body.levels;
+
+      if (
+        !Number.isInteger(duration) ||
+        duration < 1 ||
+        duration > 180
+      ) {
+        return res.status(400).json({
+          message: "Level duration must be between 1 and 180 minutes.",
+        });
+      }
+
+      if (
+        !Array.isArray(levels) ||
+        levels.length < 1 ||
+        levels.length > 100 ||
+        levels.some(
+          (level) =>
+            !Number.isFinite(Number(level.sb)) ||
+            Number(level.sb) < 0 ||
+            Number(level.sb) > 1000000 ||
+            !Number.isFinite(Number(level.bb)) ||
+            Number(level.bb) < 0 ||
+            Number(level.bb) > 1000000
+        )
+      ) {
+        return res.status(400).json({
+          message: "Blind levels are invalid.",
+        });
+      }
+
+      if (
+        !Number.isInteger(levelIndex) ||
+        levelIndex < 0 ||
+        levelIndex >= levels.length
+      ) {
+        return res.status(400).json({
+          message: "Current blind level is invalid.",
+        });
+      }
+
+      if (
+        !Number.isFinite(secondsLeft) ||
+        secondsLeft < 0 ||
+        secondsLeft > duration * 60 ||
+        typeof running !== "boolean"
+      ) {
+        return res.status(400).json({
+          message: "Timer state is invalid.",
+        });
+      }
+
+      const timer = await BlindTimer.findOneAndUpdate(
+        { leagueId: req.league._id },
+        {
+          $set: {
+            duration,
+            levelIndex,
+            secondsLeft: Math.floor(secondsLeft),
+            running,
+            deadline: running
+              ? Date.now() + Math.max(0, secondsLeft) * 1000
+              : null,
+            levels: levels.map((level) => ({
+              sb: Number(level.sb),
+              bb: Number(level.bb),
+            })),
+          },
+          $setOnInsert: {
+            leagueId: req.league._id,
+          },
+        },
+        {
+          new: true,
+          upsert: true,
+          runValidators: true,
+          setDefaultsOnInsert: true,
+        }
+      );
+
+      res.json({
+        timer: blindTimerResponse(timer),
+        message: "Blind Timer synced.",
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+
+/* ================================
+   SHARED BLIND TIMER ROUTES
+================================ */
+
+// Get the shared timer for the active league
+app.get(
+  "/api/blind-timer",
+  authenticate,
+  getActiveLeague,
+  async (req, res, next) => {
+    try {
+      let timer = await BlindTimer.findOne({
+        leagueId: req.league._id,
+      });
+
+      if (!timer) {
+        timer = await BlindTimer.create({
+          leagueId: req.league._id,
+        });
+      }
+
+      // Automatically advance the timer if its deadline has passed
+      if (timer.running && timer.deadline) {
+        const now = Date.now();
+
+        while (
+          timer.running &&
+          timer.deadline &&
+          new Date(timer.deadline).getTime() <= now
+        ) {
+          if (timer.levelIndex >= timer.levels.length - 1) {
+            timer.running = false;
+            timer.secondsLeft = 0;
+            timer.deadline = null;
+            break;
+          }
+
+          timer.levelIndex += 1;
+
+          const durationMs =
+            Math.max(1, Number(timer.duration) || 10) * 60 * 1000;
+
+         timer.deadline = timer.deadline + durationMs;
+
+         timer.secondsLeft = Math.max(
+  0,
+  Math.ceil((timer.deadline - now) / 1000)
+);
+        }
+
+        await timer.save();
+      }
+
+      return res.json({ timer });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+// Save shared timer settings and controls
+app.put(
+  "/api/blind-timer",
+authenticate,
+getActiveLeague,
+async (req, res, next) => {
+    try {
+      const {
+        duration,
+        levelIndex,
+        secondsLeft,
+        running,
+        levels,
+      } = req.body;
+
+      const safeDuration = Math.max(
+        1,
+        Math.min(180, Number(duration) || 10)
+      );
+
+      if (!Array.isArray(levels) || levels.length < 1) {
+        return res.status(400).json({
+          message: "At least one blind level is required.",
+        });
+      }
+
+      const safeLevels = levels.map((level) => ({
+        sb: Math.max(0, Number(level.sb) || 0),
+        bb: Math.max(0, Number(level.bb) || 0),
+      }));
+
+      const safeLevelIndex = Math.max(
+        0,
+        Math.min(safeLevels.length - 1, Number(levelIndex) || 0)
+      );
+
+      const safeSecondsLeft = Math.max(
+        0,
+        Number(secondsLeft) || 0
+      );
+
+      const timer = await BlindTimer.findOneAndUpdate(
+        { leagueId: req.league._id },
+        {
+          $set: {
+            duration: safeDuration,
+            levelIndex: safeLevelIndex,
+            secondsLeft: safeSecondsLeft,
+            running: Boolean(running),
+            levels: safeLevels,
+          deadline: running
+  ? Date.now() + safeSecondsLeft * 1000
+  : null,
+          },
+        },
+        {
+          new: true,
+          upsert: true,
+          runValidators: true,
+          setDefaultsOnInsert: true,
+        }
+      );
+
+      return res.json({ timer });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
 
 // Central error handler
 app.use((error, req, res, next) => {
