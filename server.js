@@ -180,7 +180,11 @@ app.get("/api/health", (req, res) => {
 ================================ */
 
 // Register a new user
+
 app.post("/api/auth/register", async (req, res, next) => {
+  let createdUser = null;
+  let createdLeague = null;
+
   try {
     const { name, email, password } = req.body;
 
@@ -190,7 +194,7 @@ app.post("/api/auth/register", async (req, res, next) => {
       typeof password !== "string"
     ) {
       return res.status(400).json({
-        message: "Name, email and password are required."
+        message: "Name, email and password are required.",
       });
     }
 
@@ -199,68 +203,118 @@ app.post("/api/auth/register", async (req, res, next) => {
 
     if (cleanName.length < 2 || cleanName.length > 80) {
       return res.status(400).json({
-        message: "Name must be between 2 and 80 characters."
+        message: "Name must be between 2 and 80 characters.",
       });
     }
 
-    if (
-      !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)
-    ) {
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
       return res.status(400).json({
-        message: "Please enter a valid email address."
+        message: "Please enter a valid email address.",
       });
     }
 
     if (password.length < 8 || password.length > 72) {
       return res.status(400).json({
-        message: "Password must be 8 to 72 characters."
+        message: "Password must be 8 to 72 characters.",
       });
     }
 
     const existingUser = await User.findOne({
-      email: cleanEmail
+      email: cleanEmail,
     });
 
     if (existingUser) {
       return res.status(409).json({
-        message: "An account with this email already exists."
+        message: "An account with this email already exists.",
       });
     }
 
     const passwordHash = await bcrypt.hash(password, 12);
 
-    const user = await User.create({
+    // Create new user.
+    createdUser = await User.create({
       name: cleanName,
       email: cleanEmail,
       passwordHash,
-      leagues: []
+      leagues: [],
     });
 
-    const token = createToken(user);
-    const populatedUser = await User.findById(user._id)
-  .populate("leagues");
+    // Create a separate personal league for this user.
+    createdLeague = await League.create({
+      name: `${cleanName}'s League`,
+      inviteCode: await generateInviteCode(),
+      creator: createdUser._id,
+      members: [createdUser._id],
+      format: "Points League",
+      seasonName: "Season 01",
+      seasonActive: true,
+      totalMatches: 7,
+      points: [10, 6, 3, 2, 1],
+    });
 
-const leagues = (populatedUser?.leagues || []).map((league) => ({
-  ...league.toObject(),
-  creator: league.creator.toString(),
-  isCreator: league.creator.toString() === user._id.toString()
-}));
+    // Create default players inside this personal league only.
+    const defaultPlayers = [
+      "Aadi",
+      "Paras",
+      "Sanyam",
+      "Sarthak",
+      "Yash",
+    ];
+
+    await Player.insertMany(
+      defaultPlayers.map((playerName) => ({
+        leagueId: createdLeague._id,
+        name: playerName,
+        totalPoints: 0,
+      }))
+    );
+
+    // Link the new league to the new user.
+    await User.findByIdAndUpdate(createdUser._id, {
+      $addToSet: {
+        leagues: createdLeague._id,
+      },
+    });
+
+    const populatedUser = await User.findById(createdUser._id)
+      .populate("leagues");
+
+    const leagues = (populatedUser?.leagues || []).map((league) => ({
+      ...league.toObject(),
+      creator: league.creator.toString(),
+      isCreator: league.creator.toString() === createdUser._id.toString(),
+    }));
+
+    const token = createToken(createdUser);
 
     return res.status(201).json({
       message: "Account created successfully.",
       token,
-      user: safeUser(user)
+      user: safeUser(createdUser),
+      leagues,
     });
+
   } catch (error) {
+    // Clean up partially created registration data if creation fails.
+    if (createdLeague) {
+      await Player.deleteMany({ leagueId: createdLeague._id });
+      await League.deleteOne({ _id: createdLeague._id });
+    }
+
+    if (createdUser) {
+      await User.deleteOne({ _id: createdUser._id });
+    }
+
     if (error.code === 11000) {
       return res.status(409).json({
-        message: "An account with this email already exists."
+        message: "An account with this email already exists.",
       });
     }
 
     next(error);
   }
 });
+
 
 
 // Log in an existing user
@@ -423,6 +477,54 @@ app.get("/api/leagues", authenticate, async (req, res, next) => {
     next(error);
   }
 });
+
+app.put(
+  "/api/auth/profile",
+  authenticate,
+  async (req, res, next) => {
+    try {
+      const { name } = req.body;
+
+      if (typeof name !== "string") {
+        return res.status(400).json({
+          message: "Account name is required.",
+        });
+      }
+
+      const cleanName = name.trim();
+
+      if (cleanName.length < 2 || cleanName.length > 80) {
+        return res.status(400).json({
+          message: "Name must be between 2 and 80 characters.",
+        });
+      }
+
+      const user = await User.findByIdAndUpdate(
+        req.user._id,
+        { $set: { name: cleanName } },
+        { new: true, runValidators: true }
+      ).select("_id name email");
+
+      if (!user) {
+        return res.status(404).json({
+          message: "User account not found.",
+        });
+      }
+
+      return res.json({
+        message: "Account name updated successfully.",
+        user: {
+          id: user._id.toString(),
+          name: user.name,
+          email: user.email,
+        },
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
 
 
 // Create a new league
