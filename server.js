@@ -21,8 +21,8 @@ const allowedOrigins = [
   process.env.CLIENT_ORIGIN,
   "http://localhost:5173",
   "http://127.0.0.1:5173",
+  "http://192.168.1.37:5173",
 ].filter(Boolean);
-
 app.use(cors({
   origin: (origin, callback) => {
     if (!origin || allowedOrigins.includes(origin)) {
@@ -1188,6 +1188,8 @@ app.get(
 );
 
 // Delete one tournament and recalculate points
+
+
 app.delete(
   "/api/tournaments/:number",
   authenticate,
@@ -1196,15 +1198,58 @@ app.delete(
   async (req, res, next) => {
     try {
       const number = Number(req.params.number);
+      const currentCount = Math.max(
+        1,
+        Number(req.league.totalMatches) || 7
+      );
+
+      if (
+        !Number.isInteger(number) ||
+        number < 1 ||
+        number > currentCount
+      ) {
+        return res.status(400).json({
+          message: "Invalid tournament number.",
+        });
+      }
+
+      if (currentCount <= 1) {
+        return res.status(400).json({
+          message: "At least one tournament must remain.",
+        });
+      }
 
       await Tournament.deleteOne({
         leagueId: req.league._id,
-        tournamentNumber: number
+        tournamentNumber: number,
       });
+
+      const laterTournaments = await Tournament.find({
+        leagueId: req.league._id,
+        tournamentNumber: { $gt: number },
+      }).sort({ tournamentNumber: 1 });
+
+      for (const tournament of laterTournaments) {
+        await Tournament.updateOne(
+          { _id: tournament._id },
+          {
+            $set: {
+              tournamentNumber: tournament.tournamentNumber - 1,
+            },
+          }
+        );
+      }
+
+      const newTotalMatches = currentCount - 1;
+
+      await League.updateOne(
+        { _id: req.league._id },
+        { $set: { totalMatches: newTotalMatches } }
+      );
 
       const [players, tournaments] = await Promise.all([
         Player.find({ leagueId: req.league._id }),
-        Tournament.find({ leagueId: req.league._id })
+        Tournament.find({ leagueId: req.league._id }),
       ]);
 
       const totals = new Map(
@@ -1214,6 +1259,7 @@ app.delete(
       for (const tournament of tournaments) {
         for (const result of tournament.results) {
           const id = result.player.toString();
+
           if (totals.has(id)) {
             totals.set(
               id,
@@ -1226,22 +1272,26 @@ app.delete(
       await Promise.all(
         players.map((player) =>
           Player.findByIdAndUpdate(player._id, {
-            totalPoints: totals.get(player._id.toString()) || 0
+            totalPoints: totals.get(player._id.toString()) || 0,
           })
         )
       );
 
-      res.json({
-        message: "Tournament deleted.",
+      return res.json({
+        message: "Tournament deleted successfully.",
+        totalMatches: newTotalMatches,
+        tournaments,
         players: await Player.find({
-          leagueId: req.league._id
-        }).sort({ totalPoints: -1, name: 1 })
+          leagueId: req.league._id,
+        }).sort({ totalPoints: -1, name: 1 }),
       });
     } catch (error) {
       next(error);
     }
   }
 );
+
+
 
 
 // Clear all current-season tournament results (creator only); keep player names and archived seasons.
